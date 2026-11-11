@@ -1,0 +1,75 @@
+name: Build Android APK and AAB
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unpack project zip
+        run: |
+          mkdir project
+          unzip -q "$(ls project*.zip | head -n 1)" -d project
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
+      - name: Install Android SDK platform
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Prepare upload key (only if added)
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
+            echo "KEYSTORE_PATH=$RUNNER_TEMP/upload.jks" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build test APK
+        working-directory: project
+        run: gradle assembleDebug --stacktrace
+
+      - name: Build Play Store bundle (AAB)
+        working-directory: project
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: gradle bundleRelease --stacktrace
+
+      - name: Collect files
+        run: |
+          mkdir dist
+          cp project/app/build/outputs/apk/debug/app-debug.apk dist/SmartQR-Scanner-2027-test.apk
+          cp project/app/build/outputs/bundle/release/app-release.aab dist/SmartQR-Scanner-2027.aab
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smartqr-build
+          path: dist/*
+
+      - name: Publish downloads (Release)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Build ${{ github.run_number }}
+          body: "Test APK to install on your phone, and AAB for Google Play."
+          files: dist/*
