@@ -18,7 +18,10 @@ jobs:
         run: |
           mkdir project
           unzip -q "$(ls project*.zip | head -n 1)" -d project
-
+      - name: Fix duplicate Kotlin libraries
+        run: |
+          sed -i "s|^dependencies {|dependencies {\n    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')|" project/app/build.gradle
+          grep -n "kotlin-bom" project/app/build.gradle
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
