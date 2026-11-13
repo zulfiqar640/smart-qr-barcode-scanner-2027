@@ -1,9 +1,10 @@
-name: Build Android APK and AAB
+name: Build Android (APK + AAB)
 
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
+  push:
+    paths:
+      - 'project*.zip'
 
 permissions:
   contents: write
@@ -13,66 +14,174 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Unpack project zip
+      - name: Unpack newest project zip
         run: |
-          mkdir project
-          unzip -q "$(ls project*.zip | head -n 1)" -d project
-      - name: Fix duplicate Kotlin libraries
-        run: |
-          sed -i "s|^dependencies {|dependencies {\n    implementation platform('org.jetbrains.kotlin:kotlin-bom:1.8.22')|" project/app/build.gradle
-          grep -n "kotlin-bom" project/app/build.gradle
+          Z=$(git log --diff-filter=AM --name-only --pretty=format: -- 'project*.zip' | grep -m1 '\.zip$' || true)
+          [ -z "$Z" ] && Z=$(ls -t project*.zip | head -1)
+          echo "Using $Z"
+          rm -rf work && mkdir work && unzip -q "$Z" -d work
+          S=$(find work -name settings.gradle | head -1)
+          echo "PROJ=$(dirname "$S")" >> $GITHUB_ENV
+
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      - uses: android-actions/setup-android@v3
+
       - uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: 8.14.3
+          gradle-version: '8.9'
 
-      - name: Install Android SDK platform
-        run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
-
-      - name: Prepare upload key (only if added)
+      - name: Get or create upload key (kept in a private DRAFT release)
         env:
-          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          if [ -n "$KEYSTORE_BASE64" ]; then
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/upload.jks"
-            echo "KEYSTORE_PATH=$RUNNER_TEMP/upload.jks" >> "$GITHUB_ENV"
+          REPO=${{ github.repository }}
+          TAG="upload-key-private"
+          ID=$(gh api "repos/$REPO/releases" --paginate -q ".[] | select(.name==\"Upload key (private)\") | .id" | head -1)
+          mkdir -p keys
+          if [ -n "$ID" ]; then
+            gh release download "$TAG" -R "$REPO" -D keys 2>/dev/null || \
+            for u in $(gh api "repos/$REPO/releases/$ID/assets" -q '.[].id'); do
+              N=$(gh api "repos/$REPO/releases/assets/$u" -q .name)
+              gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$u" > "keys/$N"
+            done
           fi
+          if [ ! -f keys/upload-keystore.jks ]; then
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -v -keystore keys/upload-keystore.jks -storetype JKS \
+              -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Smart QR Scanner, O=Smart QR, C=PK"
+            printf 'alias=upload\npassword=%s\n' "$PASS" > keys/key-info.txt
+            gh release create "$TAG" keys/upload-keystore.jks keys/key-info.txt -R "$REPO" \
+              --draft --title "Upload key (private)" --notes "Keep this safe. Do not delete."
+          fi
+          PASS=$(grep '^password=' keys/key-info.txt | cut -d= -f2)
+          echo "::add-mask::$PASS"
+          echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/keys/upload-keystore.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$PASS" >> $GITHUB_ENV
+          echo "KEY_ALIAS=upload" >> $GITHUB_ENV
 
-      - name: Build test APK
-        working-directory: project
-        run: gradle assembleDebug --stacktrace
-
-      - name: Build Play Store bundle (AAB)
-        working-directory: project
+      - name: Build
+        working-directory: ${{ env.PROJ }}
         env:
-          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-        run: gradle bundleRelease --stacktrace
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon bundleRelease assembleRelease
 
-      - name: Collect files
+      - name: Collect outputs
         run: |
-          mkdir dist
-          cp project/app/build/outputs/apk/debug/app-debug.apk dist/SmartQR-Scanner-2027-test.apk
-          cp project/app/build/outputs/bundle/release/app-release.aab dist/SmartQR-Scanner-2027.aab
-          ls -l dist
+          mkdir out
+          cp $PROJ/app/build/outputs/apk/release/*.apk out/SmartQRScanner.apk
+          cp $PROJ/app/build/outputs/bundle/release/*.aab out/SmartQRScanner.aab
 
       - uses: actions/upload-artifact@v4
         with:
-          name: smartqr-build
-          path: dist/*
+          name: android-build
+          path: out/*
 
-      - name: Publish downloads (Release)
-        uses: softprops/action-gh-release@v2
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/SmartQRScanner.apk out/SmartQRScanner.aab \
+            -R ${{ github.repository }} --title "Build ${{ github.run_number }}" \
+            --notes "APK (install on phone) and AAB (upload to Play Store)."name: Build Android (APK + AAB)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'project*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
         with:
-          tag_name: build-${{ github.run_number }}
-          name: Build ${{ github.run_number }}
-          body: "Test APK to install on your phone, and AAB for Google Play."
-          files: dist/*
+          fetch-depth: 0
+
+      - name: Unpack newest project zip
+        run: |
+          Z=$(git log --diff-filter=AM --name-only --pretty=format: -- 'project*.zip' | grep -m1 '\.zip$' || true)
+          [ -z "$Z" ] && Z=$(ls -t project*.zip | head -1)
+          echo "Using $Z"
+          rm -rf work && mkdir work && unzip -q "$Z" -d work
+          S=$(find work -name settings.gradle | head -1)
+          echo "PROJ=$(dirname "$S")" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Get or create upload key (kept in a private DRAFT release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO=${{ github.repository }}
+          TAG="upload-key-private"
+          ID=$(gh api "repos/$REPO/releases" --paginate -q ".[] | select(.name==\"Upload key (private)\") | .id" | head -1)
+          mkdir -p keys
+          if [ -n "$ID" ]; then
+            gh release download "$TAG" -R "$REPO" -D keys 2>/dev/null || \
+            for u in $(gh api "repos/$REPO/releases/$ID/assets" -q '.[].id'); do
+              N=$(gh api "repos/$REPO/releases/assets/$u" -q .name)
+              gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$u" > "keys/$N"
+            done
+          fi
+          if [ ! -f keys/upload-keystore.jks ]; then
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -v -keystore keys/upload-keystore.jks -storetype JKS \
+              -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Smart QR Scanner, O=Smart QR, C=PK"
+            printf 'alias=upload\npassword=%s\n' "$PASS" > keys/key-info.txt
+            gh release create "$TAG" keys/upload-keystore.jks keys/key-info.txt -R "$REPO" \
+              --draft --title "Upload key (private)" --notes "Keep this safe. Do not delete."
+          fi
+          PASS=$(grep '^password=' keys/key-info.txt | cut -d= -f2)
+          echo "::add-mask::$PASS"
+          echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/keys/upload-keystore.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$PASS" >> $GITHUB_ENV
+          echo "KEY_ALIAS=upload" >> $GITHUB_ENV
+
+      - name: Build
+        working-directory: ${{ env.PROJ }}
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon bundleRelease assembleRelease
+
+      - name: Collect outputs
+        run: |
+          mkdir out
+          cp $PROJ/app/build/outputs/apk/release/*.apk out/SmartQRScanner.apk
+          cp $PROJ/app/build/outputs/bundle/release/*.aab out/SmartQRScanner.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: out/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/SmartQRScanner.apk out/SmartQRScanner.aab \
+            -R ${{ github.repository }} --title "Build ${{ github.run_number }}" \
+            --notes "APK (install on phone) and AAB (upload to Play Store)."
