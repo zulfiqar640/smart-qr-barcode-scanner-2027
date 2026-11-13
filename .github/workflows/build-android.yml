@@ -1,0 +1,94 @@
+name: Build Android (APK + AAB)
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'project*.zip'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Unpack newest project zip
+        run: |
+          Z=$(git log --diff-filter=AM --name-only --pretty=format: -- 'project*.zip' | grep -m1 '\.zip$' || true)
+          [ -z "$Z" ] && Z=$(ls -t project*.zip | head -1)
+          echo "Using $Z"
+          rm -rf work && mkdir work && unzip -q "$Z" -d work
+          S=$(find work -name settings.gradle | head -1)
+          echo "PROJ=$(dirname "$S")" >> $GITHUB_ENV
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Get or create upload key (kept in a private DRAFT release)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO=${{ github.repository }}
+          TAG="upload-key-private"
+          ID=$(gh api "repos/$REPO/releases" --paginate -q ".[] | select(.name==\"Upload key (private)\") | .id" | head -1)
+          mkdir -p keys
+          if [ -n "$ID" ]; then
+            gh release download "$TAG" -R "$REPO" -D keys 2>/dev/null || \
+            for u in $(gh api "repos/$REPO/releases/$ID/assets" -q '.[].id'); do
+              N=$(gh api "repos/$REPO/releases/assets/$u" -q .name)
+              gh api -H "Accept: application/octet-stream" "repos/$REPO/releases/assets/$u" > "keys/$N"
+            done
+          fi
+          if [ ! -f keys/upload-keystore.jks ]; then
+            PASS=$(openssl rand -hex 12)
+            keytool -genkeypair -v -keystore keys/upload-keystore.jks -storetype JKS \
+              -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass "$PASS" -keypass "$PASS" \
+              -dname "CN=Smart QR Scanner, O=Smart QR, C=PK"
+            printf 'alias=upload\npassword=%s\n' "$PASS" > keys/key-info.txt
+            gh release create "$TAG" keys/upload-keystore.jks keys/key-info.txt -R "$REPO" \
+              --draft --title "Upload key (private)" --notes "Keep this safe. Do not delete."
+          fi
+          PASS=$(grep '^password=' keys/key-info.txt | cut -d= -f2)
+          echo "::add-mask::$PASS"
+          echo "KEYSTORE_FILE=$GITHUB_WORKSPACE/keys/upload-keystore.jks" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$PASS" >> $GITHUB_ENV
+          echo "KEY_ALIAS=upload" >> $GITHUB_ENV
+
+      - name: Build
+        working-directory: ${{ env.PROJ }}
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: gradle --no-daemon bundleRelease assembleRelease
+
+      - name: Collect outputs
+        run: |
+          mkdir out
+          cp $PROJ/app/build/outputs/apk/release/*.apk out/SmartQRScanner.apk
+          cp $PROJ/app/build/outputs/bundle/release/*.aab out/SmartQRScanner.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android-build
+          path: out/*
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" out/SmartQRScanner.apk out/SmartQRScanner.aab \
+            -R ${{ github.repository }} --title "Build ${{ github.run_number }}" \
+            --notes "APK (install on phone) and AAB (upload to Play Store)."
