@@ -92,7 +92,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-gh release delete "build-${{ github.run_number }}" -R ${{ github.repository }} --cleanup-tag -y || true        
+          gh release delete "build-${{ github.run_number }}" -R ${{ github.repository }} --cleanup-tag -y || true        
           gh release create "build-${{ github.run_number }}" out/SmartQRScanner.apk out/SmartQRScanner.aab \
             -R ${{ github.repository }} --title "Build ${{ github.run_number }}" \
             --notes "APK (install on phone) and AAB (upload to Play Store)."
